@@ -62,8 +62,7 @@ app.post('/enrich', async (req, res) => {
       });
       result.instagramUrl = wd.instagram;
       result.hasReservation = wd.hasReservation;
-      result.websiteTitle = wd.title;
-      result.websiteDescription = wd.metaDesc;
+      result.websiteTitle = wd.title; result.websiteDescription = wd.metaDesc;
       if (wd.cuisineType) result.restaurantType = wd.cuisineType;
       if (wd.colors?.length) result.brandColors = wd.colors;
       if (!result.restaurantType) {
@@ -89,99 +88,87 @@ app.post('/enrich', async (req, res) => {
     } catch(e) { result.errors.push('Website: ' + e.message); }
 
     // Step 2: Scrape shop/menu page
-    // Priority: shopUrl > /speisekarte (lowercase) > /Speisekarte (uppercase)
+    // Normalize URL: /Speisekarte -> /speisekarte (Foodamigos uses lowercase)
     let menuUrl = shopUrl || '';
+    if (menuUrl && menuUrl.endsWith('/Speisekarte')) {
+      menuUrl = menuUrl.slice(0, -12) + '/speisekarte';
+    }
     if (!menuUrl) {
-      const base = websiteUrl.replace(/\/+$/, '');
-      menuUrl = base + '/speisekarte';
+      menuUrl = websiteUrl.replace(/\/+$/, '') + '/speisekarte';
     }
     console.log('[ENRICH] Step 2: Shop ' + menuUrl);
     try {
       await page.goto(menuUrl, { waitUntil: 'networkidle2', timeout: 25000 });
       await new Promise(r => setTimeout(r, 5000));
 
-      // Check if redirected to homepage or 404
+      // Check if redirected or 404
       const finalUrl = page.url();
       const pageTitle = await page.title();
       const is404 = pageTitle.toLowerCase().includes('404') || pageTitle.toLowerCase().includes('not found');
-      const redirectedHome = !shopUrl && finalUrl === websiteUrl.replace(/\/+$/, '') + '/';
+      const redirectedHome = finalUrl.replace(/\/$/, '') === websiteUrl.replace(/\/$/, '');
 
-      // If lowercase failed, try uppercase
-      if ((is404 || redirectedHome) && !shopUrl) {
-        const base = websiteUrl.replace(/\/+$/, '');
-        const altUrl = base + '/Speisekarte';
-        console.log('[ENRICH] Trying uppercase: ' + altUrl);
+      if (is404 || redirectedHome) {
+        // Try uppercase as fallback
+        const altUrl = websiteUrl.replace(/\/+$/, '') + '/Speisekarte';
+        console.log('[ENRICH] Lowercase failed, trying: ' + altUrl);
         await page.goto(altUrl, { waitUntil: 'networkidle2', timeout: 20000 });
         await new Promise(r => setTimeout(r, 5000));
       }
 
-      // Now extract data from the loaded page
       const sd = await page.evaluate(() => {
         const bt = document.body?.innerText || '';
         const bl = bt.toLowerCase();
-
-        // Delivery detection
         const hasAbh = bl.includes('abholung') || bl.includes('pickup');
         const hasLief = bl.includes('lieferung') || bl.includes('delivery') || bl.includes('liefern');
         let fee = null;
-        const feePatterns = [
-          /liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i,
-          /liefergebühr[:\s]*€?\s*(\d+[.,]\d{2})/i,
-          /(\d+[.,]\d{2})\s*€?\s*liefergebühr/i,
-          /zustellgebühr[:\s]*(\d+[.,]\d{2})/i
-        ];
-        for (const p of feePatterns) {
-          const m = bt.match(p); if (m) { fee = parseFloat(m[1].replace(',', '.')); break; }
-        }
+        [/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i, /liefergebühr[:\s]*€?\s*(\d+[.,]\d{2})/i,
+         /(\d+[.,]\d{2})\s*€?\s*liefergebühr/i, /zustellgebühr[:\s]*(\d+[.,]\d{2})/i
+        ].forEach(p => { if (!fee) { const m = bt.match(p); if (m) fee = parseFloat(m[1].replace(',', '.')); }});
         const freeD = bl.includes('kostenlose lieferung') || bl.includes('gebührenfreie lieferung')
-          || bl.includes('gratis lieferung') || bl.includes('free delivery');
-
-        // Cashback
+          || bl.includes('gratis lieferung');
         let cb = '';
         const cbM = bt.match(/erhalte?\s*(\d+[.,]\d{2})\s*€?\s*guthaben\s*für\s*jede\s*(\d+[.,]\d{2})\s*€/i);
         if (cbM) cb = cbM[0];
-
-        // Promos
         const promos = [];
-        const promoMatch = bt.match(/(\d+)\s*€\s*(rabatt|off|discount|gutschein)/gi);
-        if (promoMatch) promoMatch.forEach(m => promos.push(m));
-        const codeMatch = bt.match(/code[:\s]*["\'"]?(\w{3,15})["\'"]?/gi);
-        if (codeMatch) codeMatch.forEach(m => promos.push(m));
+        const pm1 = bt.match(/(\d+)\s*€\s*(rabatt|off|discount|gutschein)/gi);
+        if (pm1) pm1.forEach(m => promos.push(m));
+        const pm2 = bt.match(/code[:\s]*["\'"]?(\w{3,15})["\'"]?/gi);
+        if (pm2) pm2.forEach(m => promos.push(m));
 
-        // ── FOODAMIGOS-SPECIFIC MENU EXTRACTION ──
+        // ── FOODAMIGOS MENU EXTRACTION ──
         const menu = [];
         const categories = [];
+        const skip = ['abholung','lieferung','anmelden','registrieren','suche','home','menü',
+          'store-details','bewerte','adresse','öffnungszeiten','impressum','datenschutz','cookie',
+          'warenkorb','gutscheine','belohnungen','coupons','am beliebtesten'];
 
-        // Strategy 1: h6 elements with prices (Foodamigos pattern)
+        // Strategy 1: Foodamigos h6 items with prices
         document.querySelectorAll('h6').forEach(h6 => {
           const text = h6.textContent?.trim();
           if (!text || text.length < 2 || text.length > 80) return;
-          // Skip navigation/UI elements
-          const skip = ['abholung','lieferung','anmelden','registrieren','suche','home','menü',
-            'store-details','bewerte','adresse','öffnungszeiten','impressum','datenschutz','cookie'];
           if (skip.some(s => text.toLowerCase().includes(s))) return;
-          // Check if parent container has a price
           const parent = h6.closest('.snap-star') || h6.closest('[class*="cursor-pointer"]') || h6.parentElement?.parentElement;
           if (!parent) return;
           const parentText = parent.textContent || '';
           const prices = parentText.match(/(\d+[.,]\d{2})\s*€/g);
           if (prices && prices.length > 0) {
             const actualPrice = prices[prices.length - 1];
-            const exists = menu.some(m => m.name === text);
-            if (!exists) menu.push({ name: text, price: actualPrice, category: '', description: '' });
+            if (!menu.some(m => m.name === text)) menu.push({ name: text, price: actualPrice, category: '', description: '' });
           }
         });
 
-        // Strategy 2: Find category buttons in horizontal scroll
-        document.querySelectorAll('[class*="horizontal-scroll"] button, [class*="scroll"] button, [class*="tab"] button').forEach(btn => {
-          const t = btn.textContent?.trim();
-          if (t && t.length > 1 && t.length < 40 && /[A-ZÄÖÜ]/.test(t)) {
-            const skip = ['home','menü','store','anmelden','registrieren','suche'];
-            if (!skip.some(s => t.toLowerCase().includes(s))) categories.push(t);
-          }
+        // Strategy 2: Horizontal scroll category buttons
+        const scrollContainers = document.querySelectorAll('[class*="horizontal-scroll"], [class*="react-horizontal"], [class*="scrollbar-hide"]');
+        scrollContainers.forEach(container => {
+          container.querySelectorAll('button, a, span').forEach(el => {
+            const t = el.textContent?.trim();
+            if (t && t.length > 1 && t.length < 40 && !skip.some(s => t.toLowerCase().includes(s))) {
+              if (/^[A-ZÄÖÜ&\s\d()Ø]+$/.test(t) || /^[A-ZÄÖÜ]/.test(t)) categories.push(t);
+            }
+          });
         });
 
-        // Strategy 3: If no h6 items found, try JSON-LD
+        // Strategy 3: JSON-LD fallback
         if (menu.length === 0) {
           document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
             try {
@@ -201,14 +188,13 @@ app.post('/enrich', async (req, res) => {
           });
         }
 
-        // Strategy 4: Text line scanning fallback
+        // Strategy 4: Text scanning fallback
         if (menu.length === 0) {
-          const lines = bt.split('\n').map(l => l.trim()).filter(l => l.length > 2);
-          let currentCat = '';
-          lines.forEach(line => {
-            const pm = line.match(/(.*?)\s+(\d+[.,]\d{2})\s*€/);
+          bt.split('\n').forEach(line => {
+            const pm = line.trim().match(/(.*?)\s+(\d+[.,]\d{2})\s*€/);
             if (pm && pm[1].trim().length > 1 && pm[1].trim().length < 80) {
-              menu.push({ name: pm[1].trim(), price: pm[2] + ' €', category: currentCat, description: '' });
+              const n = pm[1].trim();
+              if (!skip.some(s => n.toLowerCase().includes(s))) menu.push({ name: n, price: pm[2] + ' €', category: '', description: '' });
             }
           });
         }
@@ -220,58 +206,44 @@ app.post('/enrich', async (req, res) => {
           menu: menu.slice(0, 100), categories: [...new Set(categories)]
         };
       });
-      // Delivery model
       if (sd.pickupOnly) {
         result.deliveryModel = 'pickup';
-        result.deliveryNote = 'Only Abholung — no delivery option';
+        result.deliveryNote = 'Only Abholung — no delivery';
       } else if (sd.hasLieferung) {
         if (sd.freeDelivery) {
           result.deliveryModel = 'own'; result.deliveryFee = 0;
           result.deliveryNote = 'Free delivery — own drivers';
         } else if (sd.deliveryFee !== null) {
           result.deliveryFee = sd.deliveryFee;
-          if (sd.deliveryFee <= 1.5) {
-            result.deliveryModel = 'own';
-            result.deliveryNote = 'Fee ' + sd.deliveryFee.toFixed(2) + ' EUR — own drivers';
-          } else {
-            result.deliveryModel = 'net';
-            result.deliveryNote = 'Fee ' + sd.deliveryFee.toFixed(2) + ' EUR — network';
-          }
+          result.deliveryModel = sd.deliveryFee <= 1.5 ? 'own' : 'net';
+          result.deliveryNote = 'Fee ' + sd.deliveryFee.toFixed(2) + ' EUR — ' + (sd.deliveryFee <= 1.5 ? 'own drivers' : 'network');
         } else {
-          // Try clicking "Lieferung" button to reveal delivery fee
+          // Click Lieferung button to reveal fee
           try {
             const liefBtn = await page.$$eval('h6, button, [role="button"], span', els =>
               els.filter(el => el.textContent?.trim() === 'Lieferung').map(el => {
                 const r = el.getBoundingClientRect();
-                return { x: r.x + r.width/2, y: r.y + r.height/2, visible: r.width > 0 };
-              }).find(e => e.visible)
+                return { x: r.x + r.width/2, y: r.y + r.height/2, vis: r.width > 0 };
+              }).find(e => e.vis)
             );
             if (liefBtn) {
               await page.mouse.click(liefBtn.x, liefBtn.y);
-              await new Promise(r => setTimeout(r, 2000));
-              const feeAfterClick = await page.evaluate(() => {
-                const bt = document.body?.innerText || '';
-                const m = bt.match(/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i) || bt.match(/(\d+[.,]\d{2})\s*€?\s*liefergebühr/i);
+              await new Promise(r => setTimeout(r, 3000));
+              const feeAfter = await page.evaluate(() => {
+                const t = document.body?.innerText || '';
+                const m = t.match(/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i) || t.match(/(\d+[.,]\d{2})\s*€?\s*liefergebühr/i);
                 return m ? parseFloat(m[1].replace(',', '.')) : null;
               });
-              if (feeAfterClick !== null) {
-                result.deliveryFee = feeAfterClick;
-                if (feeAfterClick <= 1.5) {
-                  result.deliveryModel = 'own';
-                  result.deliveryNote = 'Fee ' + feeAfterClick.toFixed(2) + ' EUR — own drivers (after click)';
-                } else {
-                  result.deliveryModel = 'net';
-                  result.deliveryNote = 'Fee ' + feeAfterClick.toFixed(2) + ' EUR — network (after click)';
-                }
+              if (feeAfter !== null) {
+                result.deliveryFee = feeAfter;
+                result.deliveryModel = feeAfter <= 1.5 ? 'own' : 'net';
+                result.deliveryNote = 'Fee ' + feeAfter.toFixed(2) + ' EUR — ' + (feeAfter <= 1.5 ? 'own drivers' : 'network');
               } else {
                 result.deliveryModel = 'own';
-                result.deliveryNote = 'Delivery available, fee not detected after click';
+                result.deliveryNote = 'Delivery available, fee not visible';
               }
             }
-          } catch(clickErr) {
-            result.deliveryModel = 'unknown';
-            result.deliveryNote = 'Delivery available, could not check fee';
-          }
+          } catch(e) { result.deliveryNote = 'Delivery check failed'; }
         }
       }
       if (sd.cashback) result.cashbackInfo = sd.cashback;
@@ -282,71 +254,46 @@ app.post('/enrich', async (req, res) => {
       result.jsonLdFound = sd.menu.some(m => m.category);
     } catch(e) { result.errors.push('Shop: ' + e.message); }
 
-    // Step 3: Google search for Instagram if not found
+    // Step 3: Google Instagram search
     if (!result.instagramUrl && name) {
-      console.log('[ENRICH] Step 3: Google search for Instagram');
+      console.log('[ENRICH] Step 3: Google for Instagram');
       try {
-        const q = encodeURIComponent(name + ' ' + (city || '') + ' Instagram');
-        await page.goto('https://www.google.com/search?q=' + q + '&hl=en', { waitUntil: 'networkidle2', timeout: 15000 });
+        await page.goto('https://www.google.com/search?q=' + encodeURIComponent(name + ' ' + (city||'') + ' Instagram') + '&hl=en', { waitUntil: 'networkidle2', timeout: 15000 });
         await new Promise(r => setTimeout(r, 2000));
-
-        // Handle Google consent page
-        const hasConsent = await page.evaluate(() => {
-          const btns = [...document.querySelectorAll('button')];
-          const acceptBtn = btns.find(b => b.textContent?.includes('Alle akzeptieren') || b.textContent?.includes('Accept all') || b.textContent?.includes('Ich stimme zu'));
-          if (acceptBtn) { acceptBtn.click(); return true; }
-          return false;
+        // Handle consent
+        const clicked = await page.evaluate(() => {
+          const b = [...document.querySelectorAll('button')].find(b => b.textContent?.includes('Alle akzeptieren') || b.textContent?.includes('Accept all'));
+          if (b) { b.click(); return true; } return false;
         });
-        if (hasConsent) {
-          await new Promise(r => setTimeout(r, 3000));
-        }
-
-        const igUrl = await page.evaluate(() => {
-          const links = [...document.querySelectorAll('a[href]')];
-          const igLink = links.find(a => {
-            const h = a.href;
-            return h.includes('instagram.com/') && !h.includes('/p/') && !h.includes('/explore')
-              && !h.includes('/reel') && !h.includes('instagram.com/accounts');
-          });
-          return igLink ? igLink.href : '';
+        if (clicked) await new Promise(r => setTimeout(r, 3000));
+        const ig = await page.evaluate(() => {
+          const a = [...document.querySelectorAll('a')].find(a => a.href?.includes('instagram.com/') && !a.href?.includes('/p/') && !a.href?.includes('/explore'));
+          if (!a) return '';
+          const m = a.href.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
+          return m ? m[1] : '';
         });
-        if (igUrl) {
-          const match = igUrl.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
-          if (match) result.instagramUrl = match[1];
-        }
-      } catch(e) { result.errors.push('Google IG: ' + e.message); }
+        if (ig) result.instagramUrl = ig;
+      } catch(e) { result.errors.push('Google: ' + e.message); }
     }
-
-  } catch(e) {
-    result.success = false;
-    result.errors.push('Fatal: ' + e.message);
-  } finally {
-    if (page) await page.close().catch(() => {});
-  }
-  console.log('[ENRICH] Done: ' + name + ' -> dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' ig:' + (result.instagramUrl ? 'yes' : 'no'));
+  } catch(e) { result.success = false; result.errors.push('Fatal: ' + e.message); }
+  finally { if (page) await page.close().catch(() => {}); }
+  console.log('[ENRICH] Done: ' + name + ' dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' ig:' + (result.instagramUrl?'yes':'no'));
   res.json(result);
 });
-
 app.post('/enrich-bulk', async (req, res) => {
   const { restaurants } = req.body;
   if (!restaurants?.length) return res.status(400).json({ error: 'restaurants array required' });
   const results = [];
   for (const r of restaurants) {
-    console.log('[BULK] ' + (r.name || r.websiteUrl));
-    try {
-      const er = await fetch('http://localhost:3500/enrich', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(r)
-      });
-      results.push(await er.json());
-    } catch(e) { results.push({ success: false, originalName: r.name, error: e.message }); }
+    console.log('[BULK] ' + (r.name||r.websiteUrl));
+    try { const er = await fetch('http://localhost:3500/enrich', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(r) }); results.push(await er.json()); }
+    catch(e) { results.push({ success:false, originalName:r.name, error:e.message }); }
     await new Promise(r => setTimeout(r, 3000));
   }
-  res.json({ total: restaurants.length, successful: results.filter(r => r.success).length, results });
+  res.json({ total:restaurants.length, successful:results.filter(r=>r.success).length, results });
 });
-
-app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status:'ok', time:new Date().toISOString() }));
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v3 on port ' + PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v4 on port ' + PORT));
 process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
 process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(0); });
