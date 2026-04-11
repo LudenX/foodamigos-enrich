@@ -48,10 +48,8 @@ app.post('/enrich', async (req, res) => {
             if (d?.servesCuisine) cuisine = Array.isArray(d.servesCuisine) ? d.servesCuisine.join(', ') : d.servesCuisine;
           } catch(e) {}
         });
-        // Brand colors: find colored elements (not transparent/white)
         const colors = [];
         const skipBg = ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)','rgb(249, 250, 251)','rgb(0, 0, 0)','transparent'];
-        // Check colored divs (banners, headers)
         [...document.querySelectorAll('div, header, nav, a, button')].forEach(el => {
           const bg = getComputedStyle(el).backgroundColor;
           const rect = el.getBoundingClientRect();
@@ -76,13 +74,13 @@ app.post('/enrich', async (req, res) => {
           { k: ['burger','burgers','smash'], t: 'Burger' },
           { k: ['vietnam','vietnamese','pho'], t: 'Vietnamese' },
           { k: ['indisch','indian','tandoori','curry'], t: 'Indian' },
-          { k: ['türkisch','turkish','kebab','döner'], t: 'Turkish/Kebab' },
+          { k: ['türkisch','turkish','kebab','d\u00f6ner'], t: 'Turkish/Kebab' },
           { k: ['thai','pad thai'], t: 'Thai' },
           { k: ['chinesisch','chinese','asia','wok'], t: 'Asian' },
           { k: ['mexikanisch','mexican','taco','burrito'], t: 'Mexican' },
           { k: ['griechisch','greek','gyros'], t: 'Greek' },
-          { k: ['bowl','bowls','poké','smoothie'], t: 'Bowl/Healthy' },
-          { k: ['café','cafe','coffee','bakery','bäckerei'], t: 'Café/Bakery' },
+          { k: ['bowl','bowls','pok\u00e9','smoothie'], t: 'Bowl/Healthy' },
+          { k: ['caf\u00e9','cafe','coffee','bakery','b\u00e4ckerei'], t: 'Caf\u00e9/Bakery' },
           { k: ['afghan','afghani','kabul','qabeli'], t: 'Afghan' },
           { k: ['arab','arabisch','falafel','shawarma'], t: 'Arabic/Middle Eastern' },
         ];
@@ -101,37 +99,62 @@ app.post('/enrich', async (req, res) => {
       const finalUrl = page.url();
       const redirectedHome = finalUrl.replace(/\/$/, '') === websiteUrl.replace(/\/$/, '');
       if (redirectedHome && !shopUrl) {
-        const altUrl = websiteUrl.replace(/\/+$/, '') + '/Speisekarte';
-        console.log('[ENRICH] Trying uppercase: ' + altUrl);
-        await page.goto(altUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+        console.log('[ENRICH] Trying uppercase /Speisekarte');
+        await page.goto(websiteUrl.replace(/\/+$/, '') + '/Speisekarte', { waitUntil: 'networkidle2', timeout: 20000 });
         await new Promise(r => setTimeout(r, 5000));
       }
 
       const sd = await page.evaluate(() => {
         const bt = document.body?.innerText || '';
         const bl = bt.toLowerCase();
+        // Normalize NBSP to regular space for regex matching
+        const btnorm = bt.replace(/\u00a0/g, ' ');
         const hasAbh = bl.includes('abholung'); const hasLief = bl.includes('lieferung');
         let fee = null;
-        [/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i, /(\d+[.,]\d{2})\s*€?\s*liefergebühr/i, /zustellgebühr[:\s]*(\d+[.,]\d{2})/i
-        ].forEach(p => { if (!fee) { const m = bt.match(p); if (m) fee = parseFloat(m[1].replace(',','.')); }});
+        [/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i, /(\d+[.,]\d{2})\s*€?\s*liefergebühr/i
+        ].forEach(p => { if (!fee) { const m = btnorm.match(p); if (m) fee = parseFloat(m[1].replace(',','.')); }});
         const freeD = bl.includes('kostenlose lieferung') || bl.includes('gratis lieferung');
 
-        // Cashback
+        // ── CASHBACK: match with normalized text (NBSP → space) ──
         let cb = '';
-        const cbM = bt.match(/erhalte?\s*(\d+[.,]\d{2})\s*€?\s*guthaben\s*für\s*jede\s*(\d+[.,]\d{2})\s*€/i);
-        if (cbM) cb = cbM[0];
+        const cbPatterns = [
+          /erhalte?\s*(\d+[.,]\d{2})\s*€?\s*guthaben\s*f(?:ü|u)r\s*jede\s*(\d+[.,]\d{2})\s*€/i,
+          /(\d+[.,]\d{2})\s*€?\s*guthaben.*?(\d+[.,]\d{2})\s*€/i,
+          /guthaben.*?f(?:ü|u)r.*?jede/i
+        ];
+        for (const p of cbPatterns) {
+          const m = btnorm.match(p);
+          if (m) { cb = m[0]; break; }
+        }
+        // Also check for rewards program text
+        if (!cb) {
+          const rewardsLine = btnorm.split('\n').find(l => l.toLowerCase().includes('guthaben') || l.toLowerCase().includes('rewards'));
+          if (rewardsLine) cb = rewardsLine.trim();
+        }
 
-        // Promos
+        // ── PROMOS: catch all types ──
         const promos = [];
-        const pm1 = bt.match(/(\d+)\s*€\s*(rabatt|off|discount|gutschein)/gi); if (pm1) pm1.forEach(m => promos.push(m));
-        const pm2 = bt.match(/code[:\s]*["\'"]?(\w{3,15})["\'"]?/gi); if (pm2) pm2.forEach(m => promos.push(m));
+        // €-based: "9 € Rabatt", "3,00 € Rabatt"
+        const pm1 = btnorm.match(/(\d+(?:[.,]\d{2})?)\s*€\s*rabatt/gi);
+        if (pm1) pm1.forEach(m => promos.push(m.trim()));
+        // %-based: "15% Rabatt", "10% Rabatt"
+        const pm2 = btnorm.match(/(\d+)\s*%\s*rabatt[^\n]*/gi);
+        if (pm2) pm2.forEach(m => promos.push(m.trim()));
+        // Combo: "3 x 3,00 € Rabatt (MBW: 25,00 €)"
+        const pm3 = btnorm.match(/(\d+)\s*x\s*(\d+[.,]\d{2})\s*€\s*rabatt[^\n]*/gi);
+        if (pm3) pm3.forEach(m => promos.push(m.trim()));
+        // Promo codes: "Code: SHIRIN"
+        const pm4 = btnorm.match(/code[:\s]*["\'"]?([A-Z0-9]{3,15})["\'"]?/gi);
+        if (pm4) pm4.forEach(m => promos.push(m.trim()));
+        // Deduplicate: keep longest matching promo for overlaps
+        const uniquePromos = [...new Set(promos)].sort((a,b) => b.length - a.length).slice(0, 10);
 
-        // ── FOODAMIGOS MENU: h6 + prices ──
+        // ── MENU: Foodamigos h6 + prices ──
         const menu = [];
         const skip = ['abholung','lieferung','anmelden','registrieren','suche','home','menü',
           'store-details','bewerte','adresse','öffnungszeiten','impressum','datenschutz','cookie',
-          'warenkorb','gutscheine','belohnungen','coupons','am beliebtesten','add','aktionsangebote'];
-
+          'warenkorb','gutscheine','belohnungen','coupons','am beliebtesten','add','aktionsangebote',
+          'erhalte','guthaben','rewards'];
         document.querySelectorAll('h6').forEach(h6 => {
           const text = h6.textContent?.trim();
           if (!text || text.length < 3 || text.length > 80) return;
@@ -141,24 +164,16 @@ app.post('/enrich', async (req, res) => {
           if (!parent) return;
           const prices = parent.textContent?.match(/(\d+[.,]\d{2})\s*€/g);
           if (prices && prices.length > 0) {
-            const actualPrice = prices[prices.length - 1];
-            if (!menu.some(m => m.name === text)) menu.push({ name: text, price: actualPrice, category: '', description: '' });
+            if (!menu.some(m => m.name === text)) menu.push({ name: text, price: prices[prices.length-1], category: '', description: '' });
           }
         });
 
-        // ── CATEGORIES from react-horizontal-scrolling-menu ──
+        // Categories from react-horizontal-scrolling-menu
         const categories = [];
         document.querySelectorAll('.react-horizontal-scrolling-menu--item p, .react-horizontal-scrolling-menu--item span').forEach(el => {
           const t = el.textContent?.trim();
           if (t && t.length > 2 && t.length < 50 && !skip.some(s => t.toLowerCase() === s)) categories.push(t);
         });
-        // Fallback: any uppercase text in scroll containers
-        if (categories.length === 0) {
-          document.querySelectorAll('[class*="scrollbar-hide"] button, [class*="scroll-smooth"] button').forEach(el => {
-            const t = el.textContent?.trim();
-            if (t && t.length > 2 && t.length < 40 && /^[A-ZÄÖÜ]/.test(t) && !skip.some(s => t.toLowerCase().includes(s))) categories.push(t);
-          });
-        }
 
         // JSON-LD fallback
         if (menu.length === 0) {
@@ -166,14 +181,14 @@ app.post('/enrich', async (req, res) => {
             try { const d = JSON.parse(s.textContent);
               const ex = (o) => { if (o?.hasMenu?.hasMenuSection) o.hasMenu.hasMenuSection.forEach(sec => {
                 if (sec.name) categories.push(sec.name);
-                (sec.hasMenuItem||[]).forEach(i => menu.push({ name: i.name, price: i.offers?.price?i.offers.price+' €':'', category: sec.name||'', description: i.description||'' }));
+                (sec.hasMenuItem||[]).forEach(i => menu.push({ name: i.name, price: i.offers?.price?i.offers.price+' €':'', category: sec.name||'', description: '' }));
               }); };
               if (Array.isArray(d)) d.forEach(ex); else ex(d);
             } catch(e) {}
           });
         }
 
-        // Brand colors from Speisekarte (colored divs/bars)
+        // Brand colors from colored divs
         const colors = [];
         const skipBg = ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)','rgb(249, 250, 251)','rgb(0, 0, 0)','transparent'];
         [...document.querySelectorAll('div')].forEach(el => {
@@ -186,8 +201,7 @@ app.post('/enrich', async (req, res) => {
 
         return { hasAbholung: hasAbh, hasLieferung: hasLief, pickupOnly: hasAbh && !hasLief,
           deliveryFee: fee, freeDelivery: freeD, cashback: cb,
-          promos: [...new Set(promos)].slice(0, 10),
-          menu: menu.slice(0, 100), categories: [...new Set(categories)],
+          promos: uniquePromos, menu: menu.slice(0, 100), categories: [...new Set(categories)],
           shopColors: colors.slice(0, 3) };
       });
       if (sd.pickupOnly) { result.deliveryModel = 'pickup'; result.deliveryNote = 'Only Abholung'; }
@@ -204,55 +218,38 @@ app.post('/enrich', async (req, res) => {
       if (sd.menu.length) result.menu = sd.menu;
       if (sd.categories.length) result.menuCategories = sd.categories;
       result.hasRealData = sd.menu.length > 0;
-      result.jsonLdFound = sd.menu.some(m => m.category);
-      // Merge shop colors with website colors
-      if (sd.shopColors?.length) {
-        sd.shopColors.forEach(c => { if (!result.brandColors.some(bc => bc.hex === c.hex)) result.brandColors.push(c); });
-      }
+      if (sd.shopColors?.length) sd.shopColors.forEach(c => { if (!result.brandColors.some(bc => bc.hex === c.hex)) result.brandColors.push(c); });
     } catch(e) { result.errors.push('Shop: ' + e.message); }
 
-    // Step 3: DuckDuckGo search for Instagram (no consent issues)
+    // Step 3: DuckDuckGo for Instagram
     if (!result.instagramUrl && name) {
-      console.log('[ENRICH] Step 3: DuckDuckGo for Instagram');
+      console.log('[ENRICH] Step 3: DuckDuckGo IG');
       try {
-        const q = encodeURIComponent(name + ' ' + (city||'') + ' Instagram');
-        await page.goto('https://duckduckgo.com/?q=' + q, { waitUntil: 'networkidle2', timeout: 15000 });
+        await page.goto('https://duckduckgo.com/?q=' + encodeURIComponent(name + ' ' + (city||'') + ' Instagram'), { waitUntil: 'networkidle2', timeout: 15000 });
         await new Promise(r => setTimeout(r, 3000));
         const ig = await page.evaluate(() => {
-          const links = [...document.querySelectorAll('a[href]')];
-          const igLink = links.find(a => {
-            const h = a.href || '';
-            return h.includes('instagram.com/') && !h.includes('/p/') && !h.includes('/explore')
-              && !h.includes('/reel') && !h.includes('instagram.com/accounts') && !h.includes('instagram.com/about');
-          });
-          if (!igLink) return '';
-          const m = igLink.href.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
+          const a = [...document.querySelectorAll('a')].find(a => a.href?.includes('instagram.com/') && !a.href?.includes('/p/') && !a.href?.includes('/explore'));
+          if (!a) return '';
+          const m = a.href.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
           return m ? m[1] : '';
         });
         if (ig) result.instagramUrl = ig;
         else {
-          // Fallback: try Google with consent handling
-          await page.goto('https://www.google.com/search?q=' + q + '&hl=de', { waitUntil: 'networkidle2', timeout: 12000 });
+          await page.goto('https://www.google.com/search?q=' + encodeURIComponent(name + ' ' + (city||'') + ' Instagram') + '&hl=de', { waitUntil: 'networkidle2', timeout: 12000 });
           await new Promise(r => setTimeout(r, 2000));
-          await page.evaluate(() => {
-            const btns = [...document.querySelectorAll('button')];
-            const acc = btns.find(b => /alle akzeptieren|accept all|ich stimme zu|zustimmen/i.test(b.textContent));
-            if (acc) acc.click();
-          });
+          await page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(b => /alle akzeptieren|accept all|zustimmen/i.test(b.textContent)); if (b) b.click(); });
           await new Promise(r => setTimeout(r, 2000));
           const ig2 = await page.evaluate(() => {
             const a = [...document.querySelectorAll('a')].find(a => a.href?.includes('instagram.com/') && !a.href?.includes('/p/'));
-            if (!a) return '';
-            const m = a.href.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
-            return m ? m[1] : '';
+            return a ? (a.href.match(/(https?:\/\/(?:www\.)?instagram\.com\/[\w._]+)/)||[])[1] || '' : '';
           });
           if (ig2) result.instagramUrl = ig2;
         }
-      } catch(e) { result.errors.push('IG search: ' + e.message); }
+      } catch(e) { result.errors.push('IG: ' + e.message); }
     }
   } catch(e) { result.success = false; result.errors.push('Fatal: ' + e.message); }
   finally { if (page) await page.close().catch(() => {}); }
-  console.log('[ENRICH] Done: ' + name + ' dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' cats:' + result.menuCategories.length + ' ig:' + (result.instagramUrl?'yes':'no') + ' cb:' + (result.cashbackInfo?'yes':'no'));
+  console.log('[ENRICH] Done: ' + name + ' dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' cats:' + result.menuCategories.length + ' ig:' + (result.instagramUrl?'yes':'no') + ' cb:' + (result.cashbackInfo?'yes':'no') + ' promos:' + result.detectedPromos.length);
   res.json(result);
 });
 app.post('/enrich-bulk', async (req, res) => {
@@ -266,8 +263,8 @@ app.post('/enrich-bulk', async (req, res) => {
   }
   res.json({ total:restaurants.length, successful:results.filter(r=>r.success).length, results });
 });
-app.get('/health', (req, res) => res.json({ status:'ok', v: 5, time:new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status:'ok', v: 6, time:new Date().toISOString() }));
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v5 on port ' + PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v6 on port ' + PORT));
 process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
 process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(0); });
