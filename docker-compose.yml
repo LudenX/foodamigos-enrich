@@ -1,0 +1,15 @@
+version: "3.8"
+services:
+  enrich:
+    build: .
+    ports:
+      - "3500:3500"
+    restart: unless-stopped
+    environment:
+      - PORT=3500
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
