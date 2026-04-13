@@ -20,6 +20,13 @@ const SKIP_DOMAINS = ['lieferando','wolt','ubereats','doordash','yelp','tripadvi
 app.post('/enrich', async (req, res) => {
   let { websiteUrl, shopUrl, name, city } = req.body;
   if (!name && !websiteUrl) return res.status(400).json({ error: 'name or websiteUrl required' });
+  // Validate websiteUrl — reject junk (emails, phone numbers, placeholder text)
+  if (websiteUrl && (!websiteUrl.includes('.') || websiteUrl.includes('@') || /\+\d{2}/.test(websiteUrl) || /missing|not connected|keine|info@/i.test(websiteUrl))) {
+    console.log('[ENRICH] Invalid websiteUrl rejected:', websiteUrl);
+    websiteUrl = '';
+  }
+  // Ensure URL has protocol
+  if (websiteUrl && !websiteUrl.startsWith('http')) websiteUrl = 'https://' + websiteUrl;
   const result = {
     success: true, restaurantName: name || '', city: city || '',
     deliveryModel: 'unknown', deliveryFee: null, deliveryNote: '',
