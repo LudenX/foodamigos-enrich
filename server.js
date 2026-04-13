@@ -13,6 +13,9 @@ async function getBrowser() {
   return browser;
 }
 
+// Normalize text: replace NBSP (U+00A0) and other special whitespace with regular space
+function norm(text) { return (text || '').replace(/[\u00a0\u2009\u202f]/g, ' '); }
+
 app.post('/enrich', async (req, res) => {
   const { websiteUrl, shopUrl, name, city } = req.body;
   if (!websiteUrl) return res.status(400).json({ error: 'websiteUrl required' });
@@ -74,7 +77,7 @@ app.post('/enrich', async (req, res) => {
           { k: ['burger','burgers','smash'], t: 'Burger' },
           { k: ['vietnam','vietnamese','pho'], t: 'Vietnamese' },
           { k: ['indisch','indian','tandoori','curry'], t: 'Indian' },
-          { k: ['türkisch','turkish','kebab','d\u00f6ner'], t: 'Turkish/Kebab' },
+          { k: ['t\u00fcrkisch','turkish','kebab','d\u00f6ner'], t: 'Turkish/Kebab' },
           { k: ['thai','pad thai'], t: 'Thai' },
           { k: ['chinesisch','chinese','asia','wok'], t: 'Asian' },
           { k: ['mexikanisch','mexican','taco','burrito'], t: 'Mexican' },
@@ -105,54 +108,57 @@ app.post('/enrich', async (req, res) => {
       }
 
       const sd = await page.evaluate(() => {
-        const bt = document.body?.innerText || '';
+        const rawText = document.body?.innerText || '';
+        // CRITICAL: Normalize NBSP (U+00A0) and thin spaces to regular space
+        const bt = rawText.replace(/\u00a0|\u2009|\u202f/g, ' ');
         const bl = bt.toLowerCase();
-        // Normalize NBSP to regular space for regex matching
-        const btnorm = bt.replace(/\u00a0/g, ' ');
         const hasAbh = bl.includes('abholung'); const hasLief = bl.includes('lieferung');
         let fee = null;
-        [/liefergebühr[:\s]*(\d+[.,]\d{2})\s*€/i, /(\d+[.,]\d{2})\s*€?\s*liefergebühr/i
-        ].forEach(p => { if (!fee) { const m = btnorm.match(p); if (m) fee = parseFloat(m[1].replace(',','.')); }});
+        [/liefergeb\u00fchr[:\s]*(\d+[.,]\d{2})\s*\u20ac/i, /(\d+[.,]\d{2})\s*\u20ac?\s*liefergeb\u00fchr/i,
+         /zustellgeb\u00fchr[:\s]*(\d+[.,]\d{2})/i
+        ].forEach(p => { if (!fee) { const m = bt.match(p); if (m) fee = parseFloat(m[1].replace(',','.')); }});
         const freeD = bl.includes('kostenlose lieferung') || bl.includes('gratis lieferung');
 
-        // ── CASHBACK: match with normalized text (NBSP → space) ──
+        // ── CASHBACK: normalized text fixes NBSP issue ──
         let cb = '';
-        const cbPatterns = [
-          /erhalte?\s*(\d+[.,]\d{2})\s*€?\s*guthaben\s*f(?:ü|u)r\s*jede\s*(\d+[.,]\d{2})\s*€/i,
-          /(\d+[.,]\d{2})\s*€?\s*guthaben.*?(\d+[.,]\d{2})\s*€/i,
-          /guthaben.*?f(?:ü|u)r.*?jede/i
-        ];
-        for (const p of cbPatterns) {
-          const m = btnorm.match(p);
-          if (m) { cb = m[0]; break; }
-        }
-        // Also check for rewards program text
+        // Pattern 1: "Erhalte 5,00 € Guthaben für jede 50,00 €"
+        const cbM1 = bt.match(/erhalte?\s*(\d+[.,]\d{2})\s*\u20ac?\s*guthaben\s*f(?:\u00fc|u)r\s*jede\s*(\d+[.,]\d{2})\s*\u20ac/i);
+        if (cbM1) cb = cbM1[0];
+        // Pattern 2: looser — "X,XX € Guthaben ... Y,YY €"
         if (!cb) {
-          const rewardsLine = btnorm.split('\n').find(l => l.toLowerCase().includes('guthaben') || l.toLowerCase().includes('rewards'));
+          const cbM2 = bt.match(/(\d+[.,]\d{2})\s*\u20ac?\s*guthaben[^.]*?(\d+[.,]\d{2})\s*\u20ac/i);
+          if (cbM2) cb = cbM2[0];
+        }
+        // Pattern 3: find the rewards line directly
+        if (!cb) {
+          const lines = bt.split('\n');
+          const rewardsLine = lines.find(l => l.toLowerCase().includes('guthaben') && l.toLowerCase().includes('jede'));
           if (rewardsLine) cb = rewardsLine.trim();
         }
+        console.log('[ENRICH-CB] Text has guthaben:', bl.includes('guthaben'), 'Cashback found:', cb ? 'YES' : 'NO');
 
-        // ── PROMOS: catch all types ──
+        // ── PROMOS: catch all Foodamigos patterns ──
         const promos = [];
-        // €-based: "9 € Rabatt", "3,00 € Rabatt"
-        const pm1 = btnorm.match(/(\d+(?:[.,]\d{2})?)\s*€\s*rabatt/gi);
-        if (pm1) pm1.forEach(m => promos.push(m.trim()));
-        // %-based: "15% Rabatt", "10% Rabatt"
-        const pm2 = btnorm.match(/(\d+)\s*%\s*rabatt[^\n]*/gi);
-        if (pm2) pm2.forEach(m => promos.push(m.trim()));
-        // Combo: "3 x 3,00 € Rabatt (MBW: 25,00 €)"
-        const pm3 = btnorm.match(/(\d+)\s*x\s*(\d+[.,]\d{2})\s*€\s*rabatt[^\n]*/gi);
-        if (pm3) pm3.forEach(m => promos.push(m.trim()));
-        // Promo codes: "Code: SHIRIN"
-        const pm4 = btnorm.match(/code[:\s]*["\'"]?([A-Z0-9]{3,15})["\'"]?/gi);
-        if (pm4) pm4.forEach(m => promos.push(m.trim()));
-        // Deduplicate: keep longest matching promo for overlaps
+        const lines = bt.split('\n').map(l => l.trim()).filter(l => l);
+
+        lines.forEach(line => {
+          // "9 € Rabatt auf 3 Bestellungen - Code: SHIRIN"
+          if (/\d+[.,]?\d*\s*\u20ac\s*rabatt/i.test(line)) promos.push(line);
+          // "3 x 3,00 € Rabatt (MBW: 25,00 €)"
+          else if (/\d+\s*x\s*\d+[.,]\d{2}\s*\u20ac\s*rabatt/i.test(line)) promos.push(line);
+          // "15% Rabatt - nur im Shop"
+          else if (/\d+\s*%\s*rabatt/i.test(line)) promos.push(line);
+          // "Code: SHIRIN" standalone
+          else if (/code[:\s]+[A-Z0-9]{3,15}/i.test(line) && line.length < 80) promos.push(line);
+        });
+
+        // Deduplicate — keep unique, longest version
         const uniquePromos = [...new Set(promos)].sort((a,b) => b.length - a.length).slice(0, 10);
 
         // ── MENU: Foodamigos h6 + prices ──
         const menu = [];
-        const skip = ['abholung','lieferung','anmelden','registrieren','suche','home','menü',
-          'store-details','bewerte','adresse','öffnungszeiten','impressum','datenschutz','cookie',
+        const skip = ['abholung','lieferung','anmelden','registrieren','suche','home','men\u00fc',
+          'store-details','bewerte','adresse','\u00f6ffnungszeiten','impressum','datenschutz','cookie',
           'warenkorb','gutscheine','belohnungen','coupons','am beliebtesten','add','aktionsangebote',
           'erhalte','guthaben','rewards'];
         document.querySelectorAll('h6').forEach(h6 => {
@@ -162,7 +168,7 @@ app.post('/enrich', async (req, res) => {
           if (/^lieferung/i.test(text) || /registrieren/i.test(text)) return;
           const parent = h6.closest('.snap-star') || h6.closest('[class*="cursor-pointer"]') || h6.parentElement?.parentElement;
           if (!parent) return;
-          const prices = parent.textContent?.match(/(\d+[.,]\d{2})\s*€/g);
+          const prices = parent.textContent?.match(/(\d+[.,]\d{2})\s*\u20ac/g);
           if (prices && prices.length > 0) {
             if (!menu.some(m => m.name === text)) menu.push({ name: text, price: prices[prices.length-1], category: '', description: '' });
           }
@@ -181,14 +187,14 @@ app.post('/enrich', async (req, res) => {
             try { const d = JSON.parse(s.textContent);
               const ex = (o) => { if (o?.hasMenu?.hasMenuSection) o.hasMenu.hasMenuSection.forEach(sec => {
                 if (sec.name) categories.push(sec.name);
-                (sec.hasMenuItem||[]).forEach(i => menu.push({ name: i.name, price: i.offers?.price?i.offers.price+' €':'', category: sec.name||'', description: '' }));
+                (sec.hasMenuItem||[]).forEach(i => menu.push({ name: i.name, price: i.offers?.price?i.offers.price+' \u20ac':'', category: sec.name||'', description: '' }));
               }); };
               if (Array.isArray(d)) d.forEach(ex); else ex(d);
             } catch(e) {}
           });
         }
 
-        // Brand colors from colored divs
+        // Brand colors
         const colors = [];
         const skipBg = ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)','rgb(249, 250, 251)','rgb(0, 0, 0)','transparent'];
         [...document.querySelectorAll('div')].forEach(el => {
@@ -219,6 +225,7 @@ app.post('/enrich', async (req, res) => {
       if (sd.categories.length) result.menuCategories = sd.categories;
       result.hasRealData = sd.menu.length > 0;
       if (sd.shopColors?.length) sd.shopColors.forEach(c => { if (!result.brandColors.some(bc => bc.hex === c.hex)) result.brandColors.push(c); });
+      console.log('[ENRICH] Step 2 results: menu=' + sd.menu.length + ' cats=' + sd.categories.length + ' cb=' + (sd.cashback?'YES':'no') + ' promos=' + sd.promos.length);
     } catch(e) { result.errors.push('Shop: ' + e.message); }
 
     // Step 3: DuckDuckGo for Instagram
@@ -249,7 +256,7 @@ app.post('/enrich', async (req, res) => {
     }
   } catch(e) { result.success = false; result.errors.push('Fatal: ' + e.message); }
   finally { if (page) await page.close().catch(() => {}); }
-  console.log('[ENRICH] Done: ' + name + ' dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' cats:' + result.menuCategories.length + ' ig:' + (result.instagramUrl?'yes':'no') + ' cb:' + (result.cashbackInfo?'yes':'no') + ' promos:' + result.detectedPromos.length);
+  console.log('[ENRICH] Done: ' + name + ' dm:' + result.deliveryModel + ' menu:' + result.menu.length + ' ig:' + (result.instagramUrl?'yes':'no') + ' cb:' + (result.cashbackInfo?'yes':'no') + ' promos:' + result.detectedPromos.length);
   res.json(result);
 });
 app.post('/enrich-bulk', async (req, res) => {
@@ -263,8 +270,8 @@ app.post('/enrich-bulk', async (req, res) => {
   }
   res.json({ total:restaurants.length, successful:results.filter(r=>r.success).length, results });
 });
-app.get('/health', (req, res) => res.json({ status:'ok', v: 6, time:new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status:'ok', v: 7, time:new Date().toISOString() }));
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v6 on port ' + PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v7 on port ' + PORT));
 process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
 process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(0); });
