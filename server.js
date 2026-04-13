@@ -20,6 +20,7 @@ app.post('/enrich', async (req, res) => {
     success: true, restaurantName: name || '', city: city || '',
     deliveryModel: 'unknown', deliveryFee: null, deliveryNote: '',
     restaurantType: '', instagramUrl: '', hasReservation: false,
+    isFranchise: false, franchiseLocations: 0,
     cashbackInfo: '', detectedPromos: [], errors: [],
     menu: [], menuCategories: [], brandColors: [],
     websiteTitle: '', websiteDescription: '', hasRealData: false, jsonLdFound: false
@@ -31,24 +32,34 @@ app.post('/enrich', async (req, res) => {
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'de-DE,de;q=0.9' });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 900 });
-    // Capture browser console for debugging
     page.on('console', msg => console.log('[BROWSER]', msg.text()));
+
+    // Step 1: Main website
     console.log('[ENRICH] Step 1: Website ' + websiteUrl);
     try {
       await page.goto(websiteUrl, { waitUntil: 'networkidle2', timeout: 20000 });
       await new Promise(r => setTimeout(r, 2000));
       const wd = await page.evaluate(() => {
-        const allLinks = [...document.querySelectorAll('a[href]')].map(a => a.href);
-        const ig = allLinks.find(h => h.includes('instagram.com/') && !h.includes('/p/') && !h.includes('/explore') && !h.includes('/reel'));
+        const allLinks = [...document.querySelectorAll('a[href]')].map(a => ({ href: a.href, text: (a.textContent || '').trim().toLowerCase() }));
+        const ig = allLinks.find(l => l.href.includes('instagram.com/') && !l.href.includes('/p/') && !l.href.includes('/explore') && !l.href.includes('/reel'));
         const bt = document.body.innerText.toLowerCase();
         const hasRes = bt.includes('reservier') || bt.includes('tisch buchen') || bt.includes('book a table')
-          || allLinks.some(h => h.includes('opentable') || h.includes('quandoo') || h.includes('resmio'));
+          || allLinks.some(l => l.href.includes('opentable') || l.href.includes('quandoo') || l.href.includes('resmio'));
         let cuisine = '';
         document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
           try { const d = JSON.parse(s.textContent);
             if (d && d.servesCuisine) cuisine = Array.isArray(d.servesCuisine) ? d.servesCuisine.join(', ') : d.servesCuisine;
           } catch(e) {}
         });
+        // Franchise detection
+        const franchiseSignals = [];
+        const franchiseWords = ['standorte','filialen','locations','branches','unsere restaurants','our locations','alle standorte'];
+        allLinks.forEach(l => { if (franchiseWords.some(w => l.text.includes(w) || l.href.includes(w.replace(' ','-')))) franchiseSignals.push(l.text || l.href); });
+        if (franchiseWords.some(w => bt.includes(w))) franchiseSignals.push('text-match');
+        let locationCount = 0;
+        const locMatch = bt.match(/(\d+)\s*(?:standorte|filialen|locations|restaurants)/i);
+        if (locMatch) locationCount = parseInt(locMatch[1]);
+        // Brand colors
         const colors = [];
         const skipBg = ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)','rgb(249, 250, 251)','rgb(0, 0, 0)','transparent'];
         document.querySelectorAll('div, header, nav').forEach(el => {
@@ -58,15 +69,18 @@ app.post('/enrich', async (req, res) => {
             if (!colors.some(c => c.hex === bg)) colors.push({ hex: bg, role: 'Brand' });
           }
         });
-        return { instagram: ig || '', hasReservation: hasRes, cuisineType: cuisine,
+        return { instagram: ig ? ig.href : '', hasReservation: hasRes, cuisineType: cuisine,
           title: document.title, metaDesc: document.querySelector('meta[name="description"]')?.content || '',
-          colors: colors.slice(0, 5) };
+          colors: colors.slice(0, 5), isFranchise: franchiseSignals.length > 0, franchiseLocations: locationCount, franchiseSignals };
       });
       result.instagramUrl = wd.instagram;
       result.hasReservation = wd.hasReservation;
       result.websiteTitle = wd.title; result.websiteDescription = wd.metaDesc;
       if (wd.cuisineType) result.restaurantType = wd.cuisineType;
       if (wd.colors.length) result.brandColors = wd.colors;
+      result.isFranchise = wd.isFranchise;
+      result.franchiseLocations = wd.franchiseLocations;
+      if (wd.isFranchise) console.log('[ENRICH] Franchise detected! Signals:', wd.franchiseSignals.join(', '));
       if (!result.restaurantType) {
         const combined = (wd.title + ' ' + (name || '')).toLowerCase();
         const ct = [['sushi','japanisch','ramen','Japanese/Sushi'],['pizza','pizzeria','italiano','pasta','Italian/Pizza'],
@@ -95,7 +109,6 @@ app.post('/enrich', async (req, res) => {
       }
       const sd = await page.evaluate(() => {
         const rawText = document.body.innerText || '';
-        // Normalize NBSP to space using charCode (ASCII-safe)
         const bt = rawText.split('').map(c => c.charCodeAt(0) === 160 ? ' ' : c).join('');
         const bl = bt.toLowerCase();
         const hasAbh = bl.includes('abholung') || bl.includes('pickup');
@@ -104,38 +117,26 @@ app.post('/enrich', async (req, res) => {
         const feeMatch = bt.match(/[Ll]iefergeb.hr.*?(\d+[.,]\d{2})/);
         if (feeMatch) fee = parseFloat(feeMatch[1].replace(',','.'));
         const freeD = bl.includes('kostenlose lieferung') || bl.includes('gratis lieferung') || bl.includes('free delivery');
-
-        // CASHBACK: search in BOTH German and English
+        // CASHBACK: dual-language
         let cb = '';
         const lines = bt.split('\n');
         for (const line of lines) {
           const ll = line.toLowerCase();
-          // German: "Erhalte X € Guthaben für jede Y €"
           if (ll.includes('guthaben') && (ll.includes('jede') || ll.includes('every'))) { cb = line.trim(); break; }
-          // English: "Earn X € credit for every Y €"
           if (ll.includes('credit') && (ll.includes('every') || ll.includes('jede'))) { cb = line.trim(); break; }
-          // Generic: "rewards" + amount pattern
           if ((ll.includes('rewards') || ll.includes('belohnungen')) && /\d+[.,]\d{2}/.test(line)) { cb = line.trim(); break; }
         }
         console.log('[CB] guthaben:', bl.includes('guthaben'), 'credit:', bl.includes('credit'), 'rewards:', bl.includes('rewards'), 'Found:', cb ? 'YES' : 'NO');
-
-        // PROMOS: German + English
+        // PROMOS: dual-language
         const promos = [];
         for (const line of lines) {
           const lt = line.trim();
           if (lt.length < 5 || lt.length > 150) continue;
           const ll = lt.toLowerCase();
-          // German: rabatt, English: discount
-          if (ll.includes('rabatt') || ll.includes('discount')) {
-            if (!promos.includes(lt)) promos.push(lt);
-          }
-          // Promo codes
-          else if (/code[:\s]+[A-Za-z0-9]{3,}/i.test(lt) && lt.length < 80) {
-            if (!promos.includes(lt)) promos.push(lt);
-          }
+          if (ll.includes('rabatt') || ll.includes('discount')) { if (!promos.includes(lt)) promos.push(lt); }
+          else if (/code[\s:]+[A-Za-z0-9]{3,}/i.test(lt) && lt.length < 80) { if (!promos.includes(lt)) promos.push(lt); }
         }
-
-        // MENU: h6 items (Foodamigos)
+        // MENU: h6 in snap-star containers
         const menu = [];
         const skipWords = ['abholung','lieferung','anmelden','registrieren','suche','home','pickup','delivery',
           'store','bewerte','adresse','impressum','datenschutz','cookie','sign','login',
@@ -153,14 +154,12 @@ app.post('/enrich', async (req, res) => {
             if (!menu.some(m => m.name === text)) menu.push({ name: text, price: price, category: '' });
           }
         });
-
         // CATEGORIES
         const categories = [];
         document.querySelectorAll('.react-horizontal-scrolling-menu--item p, .react-horizontal-scrolling-menu--item span').forEach(el => {
           const t = el.textContent.trim();
           if (t && t.length > 2 && t.length < 50) categories.push(t);
         });
-
         // JSON-LD fallback
         if (menu.length === 0) {
           document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
@@ -173,7 +172,6 @@ app.post('/enrich', async (req, res) => {
             } catch(e) {}
           });
         }
-
         // COLORS
         const colors = [];
         const skipBg = ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)','rgb(249, 250, 251)','rgb(0, 0, 0)','transparent'];
@@ -184,7 +182,6 @@ app.post('/enrich', async (req, res) => {
             if (!colors.some(c => c.hex === bg)) colors.push({ hex: bg, role: 'Brand' });
           }
         });
-
         return { hasAbholung: hasAbh, hasLieferung: hasLief, pickupOnly: hasAbh && !hasLief,
           deliveryFee: fee, freeDelivery: freeD, cashback: cb,
           promos: promos.slice(0, 10), menu: menu.slice(0, 100), categories: [...new Set(categories)],
@@ -208,6 +205,7 @@ app.post('/enrich', async (req, res) => {
       console.log('[ENRICH] Step 2 done: menu=' + sd.menu.length + ' cb=' + (sd.cashback ? 'YES' : 'no') + ' promos=' + sd.promos.length);
     } catch(e) { result.errors.push('Shop: ' + e.message); }
 
+    // Step 3: DuckDuckGo for Instagram
     if (!result.instagramUrl && name) {
       console.log('[ENRICH] Step 3: DuckDuckGo IG');
       try {
@@ -222,9 +220,10 @@ app.post('/enrich', async (req, res) => {
     }
   } catch(e) { result.success = false; result.errors.push('Fatal: ' + e.message); }
   finally { if (page) await page.close().catch(() => {}); }
-  console.log('[ENRICH] Done: ' + name + ' menu:' + result.menu.length + ' cb:' + (result.cashbackInfo ? 'YES' : 'no') + ' promos:' + result.detectedPromos.length + ' ig:' + (result.instagramUrl ? 'yes' : 'no'));
+  console.log('[ENRICH] Done: ' + name + ' menu:' + result.menu.length + ' cb:' + (result.cashbackInfo ? 'YES' : 'no') + ' promos:' + result.detectedPromos.length + ' ig:' + (result.instagramUrl ? 'yes' : 'no') + ' franchise:' + result.isFranchise);
   res.json(result);
 });
+
 app.post('/enrich-bulk', async (req, res) => {
   const { restaurants } = req.body;
   if (!restaurants || !restaurants.length) return res.status(400).json({ error: 'restaurants array required' });
@@ -236,8 +235,9 @@ app.post('/enrich-bulk', async (req, res) => {
   }
   res.json({ total:restaurants.length, successful:results.filter(r => r.success).length, results });
 });
-app.get('/health', (req, res) => res.json({ status:'ok', v: 9, time:new Date().toISOString() }));
+
+app.get('/health', (req, res) => res.json({ status:'ok', v: 10, time:new Date().toISOString() }));
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v9 on port ' + PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v10 on port ' + PORT));
 process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
 process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(0); });
