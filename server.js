@@ -8,7 +8,7 @@ let browser = null;
 async function getBrowser() {
   if (!browser || !browser.isConnected()) {
     browser = await puppeteer.launch({ headless: 'new', executablePath: '/usr/bin/chromium',
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'] });
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--lang=de-DE'] });
   }
   return browser;
 }
@@ -28,8 +28,11 @@ app.post('/enrich', async (req, res) => {
   try {
     const b = await getBrowser();
     page = await b.newPage();
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'de-DE,de;q=0.9' });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 900 });
+    // Capture browser console for debugging
+    page.on('console', msg => console.log('[BROWSER]', msg.text()));
     console.log('[ENRICH] Step 1: Website ' + websiteUrl);
     try {
       await page.goto(websiteUrl, { waitUntil: 'networkidle2', timeout: 20000 });
@@ -91,57 +94,53 @@ app.post('/enrich', async (req, res) => {
         await new Promise(r => setTimeout(r, 5000));
       }
       const sd = await page.evaluate(() => {
-        // Get all text, normalize all whitespace to regular spaces
         const rawText = document.body.innerText || '';
+        // Normalize NBSP to space using charCode (ASCII-safe)
         const bt = rawText.split('').map(c => c.charCodeAt(0) === 160 ? ' ' : c).join('');
         const bl = bt.toLowerCase();
-        const hasAbh = bl.includes('abholung');
-        const hasLief = bl.includes('lieferung');
+        const hasAbh = bl.includes('abholung') || bl.includes('pickup');
+        const hasLief = bl.includes('lieferung') || bl.includes('delivery');
         let fee = null;
         const feeMatch = bt.match(/[Ll]iefergeb.hr.*?(\d+[.,]\d{2})/);
         if (feeMatch) fee = parseFloat(feeMatch[1].replace(',','.'));
-        if (!fee) { const fm2 = bt.match(/(\d+[.,]\d{2}).*?[Ll]iefergeb.hr/); if (fm2) fee = parseFloat(fm2[1].replace(',','.')); }
-        const freeD = bl.includes('kostenlose lieferung') || bl.includes('gratis lieferung');
+        const freeD = bl.includes('kostenlose lieferung') || bl.includes('gratis lieferung') || bl.includes('free delivery');
 
-        // CASHBACK: simple line search - no regex unicode issues
+        // CASHBACK: search in BOTH German and English
         let cb = '';
         const lines = bt.split('\n');
         for (const line of lines) {
           const ll = line.toLowerCase();
-          if (ll.includes('guthaben') && ll.includes('jede')) {
-            cb = line.trim();
-            break;
-          }
+          // German: "Erhalte X € Guthaben für jede Y €"
+          if (ll.includes('guthaben') && (ll.includes('jede') || ll.includes('every'))) { cb = line.trim(); break; }
+          // English: "Earn X € credit for every Y €"
+          if (ll.includes('credit') && (ll.includes('every') || ll.includes('jede'))) { cb = line.trim(); break; }
+          // Generic: "rewards" + amount pattern
+          if ((ll.includes('rewards') || ll.includes('belohnungen')) && /\d+[.,]\d{2}/.test(line)) { cb = line.trim(); break; }
         }
-        if (!cb) {
-          for (const line of lines) {
-            if (line.toLowerCase().includes('guthaben') && line.toLowerCase().includes('rewards')) {
-              cb = line.trim();
-              break;
-            }
-          }
-        }
-        console.log('[CB-DEBUG] Lines scanned:', lines.length, 'Guthaben found:', bl.includes('guthaben'), 'Result:', cb ? cb.substring(0,50) : 'EMPTY');
+        console.log('[CB] guthaben:', bl.includes('guthaben'), 'credit:', bl.includes('credit'), 'rewards:', bl.includes('rewards'), 'Found:', cb ? 'YES' : 'NO');
 
-        // PROMOS: line-by-line search
+        // PROMOS: German + English
         const promos = [];
         for (const line of lines) {
           const lt = line.trim();
-          if (lt.length < 5 || lt.length > 120) continue;
+          if (lt.length < 5 || lt.length > 150) continue;
           const ll = lt.toLowerCase();
+          // German: rabatt, English: discount
           if (ll.includes('rabatt') || ll.includes('discount')) {
             if (!promos.includes(lt)) promos.push(lt);
-          } else if (/code[:\s]+[A-Z0-9]{3,}/i.test(lt) && lt.length < 80) {
+          }
+          // Promo codes
+          else if (/code[:\s]+[A-Za-z0-9]{3,}/i.test(lt) && lt.length < 80) {
             if (!promos.includes(lt)) promos.push(lt);
           }
         }
 
-        // MENU: h6 items
+        // MENU: h6 items (Foodamigos)
         const menu = [];
-        const skipWords = ['abholung','lieferung','anmelden','registrieren','suche','home',
-          'store-details','bewerte','adresse','impressum','datenschutz','cookie',
+        const skipWords = ['abholung','lieferung','anmelden','registrieren','suche','home','pickup','delivery',
+          'store','bewerte','adresse','impressum','datenschutz','cookie','sign','login',
           'warenkorb','gutscheine','belohnungen','coupons','beliebtesten','add','aktionsangebote',
-          'erhalte','guthaben','rewards','hinzu'];
+          'erhalte','guthaben','rewards','hinzu','earn','credit','cart','popular'];
         document.querySelectorAll('h6').forEach(h6 => {
           const text = h6.textContent.trim();
           if (!text || text.length < 3 || text.length > 80) return;
@@ -151,7 +150,7 @@ app.post('/enrich', async (req, res) => {
           const priceMatches = parent.textContent.match(/(\d+[.,]\d{2})/g);
           if (priceMatches && priceMatches.length > 0) {
             const price = priceMatches[priceMatches.length - 1];
-            if (!menu.some(m => m.name === text)) menu.push({ name: text, price: price + ' E', category: '' });
+            if (!menu.some(m => m.name === text)) menu.push({ name: text, price: price, category: '' });
           }
         });
 
@@ -209,7 +208,6 @@ app.post('/enrich', async (req, res) => {
       console.log('[ENRICH] Step 2 done: menu=' + sd.menu.length + ' cb=' + (sd.cashback ? 'YES' : 'no') + ' promos=' + sd.promos.length);
     } catch(e) { result.errors.push('Shop: ' + e.message); }
 
-    // Step 3: DuckDuckGo for Instagram
     if (!result.instagramUrl && name) {
       console.log('[ENRICH] Step 3: DuckDuckGo IG');
       try {
@@ -217,22 +215,9 @@ app.post('/enrich', async (req, res) => {
         await new Promise(r => setTimeout(r, 3000));
         const ig = await page.evaluate(() => {
           const a = [...document.querySelectorAll('a')].find(a => a.href && a.href.includes('instagram.com/') && !a.href.includes('/p/') && !a.href.includes('/explore'));
-          if (!a) return '';
-          const m = a.href.match(/(https:\/\/(?:www\.)?instagram\.com\/[\w._]+)/);
-          return m ? m[1] : '';
+          return a ? (a.href.match(/(https:\/\/(?:www\.)?instagram\.com\/[\w._]+)/)||[])[1] || '' : '';
         });
         if (ig) result.instagramUrl = ig;
-        else {
-          await page.goto('https://www.google.com/search?q=' + encodeURIComponent(name + ' ' + (city||'') + ' Instagram') + '&hl=de', { waitUntil: 'networkidle2', timeout: 12000 });
-          await new Promise(r => setTimeout(r, 2000));
-          await page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(b => /alle akzeptieren|accept all|zustimmen/i.test(b.textContent)); if (b) b.click(); });
-          await new Promise(r => setTimeout(r, 2000));
-          const ig2 = await page.evaluate(() => {
-            const a = [...document.querySelectorAll('a')].find(a => a.href && a.href.includes('instagram.com/') && !a.href.includes('/p/'));
-            return a ? (a.href.match(/(https:\/\/(?:www\.)?instagram\.com\/[\w._]+)/)||[])[1] || '' : '';
-          });
-          if (ig2) result.instagramUrl = ig2;
-        }
       } catch(e) { result.errors.push('IG: ' + e.message); }
     }
   } catch(e) { result.success = false; result.errors.push('Fatal: ' + e.message); }
@@ -251,8 +236,8 @@ app.post('/enrich-bulk', async (req, res) => {
   }
   res.json({ total:restaurants.length, successful:results.filter(r => r.success).length, results });
 });
-app.get('/health', (req, res) => res.json({ status:'ok', v: 8, time:new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status:'ok', v: 9, time:new Date().toISOString() }));
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v8 on port ' + PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('Enrichment server v9 on port ' + PORT));
 process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
 process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(0); });
